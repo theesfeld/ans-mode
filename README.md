@@ -2,7 +2,7 @@
 
 `ans-mode` is an Emacs major mode for ANSI art. Open a `.ans` file and Emacs draws the picture: a VGA font raster, in the colors the file asked for, with the SAUCE title and author in the header line.
 
-Press `t` for a Unicode text view of the same screen. That view can be searched and copied. Press `e` to edit the screen: typed characters replace the cell under the cursor. Saving before you edit writes the original file bytes. Saving after you edit writes the screen you see, as ANSi, and keeps the SAUCE title, author, and comments.
+Press `t` for a Unicode text view of the same screen. That view can be searched and copied. Press `e` to edit the screen: typed characters replace the cell under the cursor. While you edit, the header line shows the pen, the sixteen VGA colors, and the glyphs on F1 through F12. Saving before you edit writes the original file bytes. Saving after you edit writes the screen you see, as ANSi, and keeps the SAUCE title, author, and comments.
 
 The picture is a still. An ANSiMation is the screen left after the whole stream has been drawn. Blink is kept as a color attribute.
 
@@ -83,7 +83,7 @@ If `use-package-always-ensure` is on, tell `use-package` this copy is local:
 
 ## Open a file
 
-Visit a file whose name ends in `.ans`, in any letter case. The mode turns on by itself. The buffer is read-only. Point sits on the picture, and the header line names what you are looking at.
+Visit a file whose name ends in `.ans`, in any letter case. The mode turns on by itself. The buffer is read-only. Point sits on the picture, and the header line names what you are looking at. While editing, that line shows the pen and the drawing keys. See [Editing](#editing).
 
 The header line is built from whatever the file records:
 
@@ -132,7 +132,7 @@ Press `t` to switch. `t` again returns to the other view. If the raster cannot b
 
 | Key | Command | What it does |
 | --- | --- | --- |
-| `e` | `ans-edit-mode` | Edit the screen. Letters then type glyphs. `C-c C-c` leaves edit mode. |
+| `e` | `ans-edit-mode` | Edit the screen. The header line shows the pen, the VGA colors, and F1–F12. `C-c C-c` leaves edit mode. |
 | `t` | `ans-toggle-view` | Switch between the raster and the text view. |
 | `+` | `ans-increase-scale` | Make the raster one step larger, up to 8. |
 | `-` | `ans-decrease-scale` | Make the raster one step smaller, down to 1. |
@@ -272,14 +272,40 @@ Comments are also counted in the header line. The artwork itself stops before th
 
 ## Editing
 
-`e` turns on editing. The header line shows the cursor as `row,column`, counting from 1, and the pen as `pen foreground/background`. In the raster the current cell is inverted. In the text view the Emacs cursor sits on that cell. Click a cell to move there.
+`e` turns on editing. The header line becomes the drawing bar. From left to right it shows:
+
+- the cursor, as `row,column`, counting from 1
+- the pen: two blocks in the current foreground and background, then the color names, and `ul` when underline is on
+- sixteen VGA color chips, black on the left through white on the right
+- the drawing-set name
+- the glyph on each of F1 through F12
+
+Click a chip to take that foreground. Right-click a chip to take that background. The foreground chip has a light or dark rim, and the background chip has a gold rim. Roll the mouse wheel on the bar to cycle the foreground. Hold Meta and roll the wheel to cycle the background.
+
+`M-right` and `M-left` cycle the foreground. `M-up` and `M-down` cycle the background. A pen that holds a 256-color or 24-bit value returns to the VGA set on the first cycle. Foreground continues from light gray, and background continues from black.
+
+`C-c C-f` and `C-c C-b` read one key. The echo area shows `0` through `9` and `A` through `F`, each digit drawn in that VGA color. Press the digit you want. `RET` keeps the current VGA color. `C-g` cancels.
+
+F1 through F12 type the glyph the bar shows for that key. While you are editing, those keys are drawing keys. `M-n` shows the next drawing set, and `M-p` shows the previous one. Click the set name for the next set. Right-click the name for the previous set.
+
+| Set | F1 | F2 | F3 | F4 | F5 | F6 | F7 | F8 | F9 | F10 | F11 | F12 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Blocks | ░ | ▒ | ▓ | █ | ▀ | ▄ | ▌ | ▐ | ■ | · | • | ∙ |
+| Double lines | ╔ | ╗ | ╚ | ╝ | ═ | ║ | ╠ | ╣ | ╦ | ╩ | ╬ | █ |
+| Single lines | ┌ | ┐ | └ | ┘ | ─ | │ | ├ | ┤ | ┬ | ┴ | ┼ | █ |
+
+Editing starts on Blocks. In the raster the current cell is inverted. In the text view the Emacs cursor sits on that cell. Click a cell to move there.
 
 Typing replaces that cell and moves to the next one. At the right edge the cursor wraps to the next row, and a new row is added when you type or move past the last one. The picture is a fixed grid: a new character overwrites the cell. It does not push the rest of the line sideways.
 
 | Key | What it does while editing |
 | --- | --- |
 | letters, numbers, punctuation, `SPC` | Write that CP437 glyph with the current pen. |
+| `F1`–`F12` | Write the glyph shown for that key on the bar. |
 | arrows, `C-f`, `C-b`, `C-n`, `C-p` | Move one cell. |
+| `M-right`, `M-left` | Next and previous foreground. |
+| `M-up`, `M-down` | Next and previous background. |
+| `M-n`, `M-p` | Next and previous drawing set. |
 | `C-a`, `Home` | First column of this row. |
 | `C-e`, `End` | Last drawn cell on this row. |
 | `TAB` | Next eighth column. |
@@ -287,8 +313,8 @@ Typing replaces that cell and moves to the next one. At the right edge the curso
 | `DEL`, `Backspace` | Move back one cell and paint a space with the pen. |
 | `C-/`, `C-_`, `C-x u` | Undo the last cell change. |
 | `C-?` | Redo the cell change just undone. |
-| `C-c C-f` | Set the foreground, 0 through 15. |
-| `C-c C-b` | Set the background, 0 through 15. |
+| `C-c C-f` | Set the foreground from one hex digit, 0 through F. |
+| `C-c C-b` | Set the background from one hex digit, 0 through F. |
 | `C-c C-u` | Toggle underline for cells typed from now on. |
 | `C-c C-p` | Copy the current cell's colors into the pen. |
 | `C-c C-t` | Switch between the raster and the text view. |
@@ -296,11 +322,11 @@ Typing replaces that cell and moves to the next one. At the right edge the curso
 | `C-c C-s` | Show the SAUCE record. |
 | `C-c C-w` | Set the column count. |
 | `C-c C-r` | Reload the file from disk and discard edits. |
-| `C-c C-c` | Leave edit mode. |
+| `C-c C-c` | Leave edit mode. `F1`–`F12` return to their usual commands. |
 
 The palette is the VGA set. 0 is black, 1 red, 2 green, 3 brown, 4 blue, 5 magenta, 6 cyan, 7 light gray. 8 through 15 are the bright versions of those, ending at 15 white. A background of 8 through 15 is a bright background.
 
-`C-c C-p` can pick a 256-color or 24-bit color out of an existing cell. The next characters you type keep that color. `C-c C-f` and `C-c C-b` return the pen to a VGA index.
+`C-c C-p` can pick a 256-color or 24-bit color out of an existing cell. The next characters you type keep that color. `C-c C-f`, `C-c C-b`, a click on a chip, or a meta-arrow returns the pen to a VGA index.
 
 Viewer keys such as `t` and `s` type those letters while you are editing. Use the `C-c C-` bindings above for those commands, then `C-c C-c` when you want the viewer keys back.
 

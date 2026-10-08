@@ -4,7 +4,7 @@
 
 ;; Author: William Theesfeld <william@theesfeld.net>
 ;; Keywords: multimedia, faces
-;; Version: 0.2.0
+;; Version: 0.3.0
 ;; Package-Requires: ((emacs "28.1"))
 ;; URL: https://github.com/theesfeld/ans-mode
 
@@ -53,6 +53,10 @@
 ;;   n / p    next and previous .ans in this directory
 ;;   g        reload the file
 ;;   q        quit the buffer
+;;
+;; While editing, the header bar shows the pen and the F1-F12 glyphs.
+;; Arrows move from cell to cell.  `M-right' and `M-left' change the
+;; foreground, and `M-up' and `M-down' change the background.
 
 ;;; Code:
 
@@ -117,6 +121,26 @@ The raster does not use this font."
   "Background palette index, 256-color index, or (R G B) list.")
 (defvar-local ans--pen-underline nil
   "Non-nil when the pen underlines new cells.")
+(defvar-local ans--glyph-bank 0
+  "Index of the drawing set shown on the edit bar.")
+
+(defconst ans-edit-vga-names
+  ["black" "red" "green" "brown" "blue" "magenta" "cyan" "light gray"
+   "dark gray" "bright red" "bright green" "yellow"
+   "bright blue" "bright magenta" "bright cyan" "white"]
+  "Names of VGA colors 0 through 15.")
+
+(defconst ans-edit-glyph-banks
+  '(("Blocks"
+     #xB0 #xB1 #xB2 #xDB #xDF #xDC #xDD #xDE #xFE #xFA #x07 #xF9)
+    ("Double lines"
+     #xC9 #xBB #xC8 #xBC #xCD #xBA #xCC #xB9 #xCB #xCA #xCE #xDB)
+    ("Single lines"
+     #xDA #xBF #xC0 #xD9 #xC4 #xB3 #xC3 #xB4 #xC2 #xC1 #xC5 #xDB))
+  "Drawing sets for F1 through F12.
+Each element is (NAME BYTE...).  BYTE is a CP437 code.  Blocks is the
+shade and half-block set.  Double lines and single lines are the box
+characters, and F12 in those sets is a solid block.")
 
 (defun ans--capture-bytes ()
   "Return the buffer contents as raw bytes."
@@ -337,7 +361,14 @@ CELL-WIDTH is 8 or 9.  FONT defaults from the SAUCE font name."
        ((not (string-empty-p group)) group)))))
 
 (defun ans--header-line ()
-  "Header line for the current ANSI buffer."
+  "Header line for the current ANSI buffer.
+While editing, this is the pen, the VGA colors, and the F-key glyphs."
+  (if (bound-and-true-p ans-edit-mode)
+      (ans--edit-bar)
+    (ans--info-header)))
+
+(defun ans--info-header ()
+  "Header line that names the artwork."
   (if (not (ans-grid-p ans--grid))
       "ANSI"
     (let* ((sauce (ans-grid-sauce ans--grid))
@@ -368,14 +399,7 @@ CELL-WIDTH is 8 or 9.  FONT defaults from the SAUCE font name."
                             (length comments)
                             (if (= (length comments) 1) "" "s")))
                   (when (ans-grid-truncated ans--grid) "truncated")
-                  ans--image-skip
-                  (when (bound-and-true-p ans-edit-mode)
-                    (format "edit %d,%d  pen %s/%s%s"
-                            (1+ ans--cursor-row)
-                            (1+ ans--cursor-col)
-                            (ans--color-label ans--pen-fg)
-                            (ans--color-label ans--pen-bg)
-                            (if ans--pen-underline " ul" ""))))))
+                  ans--image-skip)))
       (mapconcat #'identity (delq nil parts) "  ·  "))))
 
 (defun ans--redisplay ()
@@ -748,13 +772,179 @@ EDITED is the previous value of `ans--edited'."
   "Return a cell for CP437 BYTE using the current pen."
   (ans-make-cell byte ans--pen-fg ans--pen-bg (if ans--pen-underline 1 0)))
 
+(defun ans--ink (index)
+  "Return a readable ink color against VGA palette INDEX."
+  (let ((rgb (aref ans-palette index)))
+    (if (> (+ (* 3 (nth 0 rgb)) (* 6 (nth 1 rgb)) (nth 2 rgb)) 1200)
+        "#000000"
+      "#FFFFFF")))
+
+(defun ans--vga-name (color)
+  "Return the short name of COLOR."
+  (if (and (integerp color) (<= 0 color 15))
+      (aref ans-edit-vga-names color)
+    (ans--color-label color)))
+
+(defun ans--cycle-palette (color delta fallback)
+  "Return FALLBACK plus DELTA, or COLOR plus DELTA, wrapped to 0-15.
+COLOR is used when it is already a VGA index."
+  (mod (+ (if (and (integerp color) (<= 0 color 15)) color fallback) delta) 16))
+
+(defun ans--palette-key-line ()
+  "Return 0-9 and a-f, each digit drawn in that VGA color."
+  (let ((out ""))
+    (dotimes (i 16)
+      (setq out
+            (concat out
+                    (propertize (format "%X" i)
+                                'face (list :foreground (ans--hex (aref ans-palette i))
+                                            :background "#000000"
+                                            :weight 'bold))
+                    " ")))
+    out))
+
 (defun ans--read-palette (prompt current)
-  "Read a VGA palette index, prompting with PROMPT.
-CURRENT is the value shown as the default."
-  (let ((n (truncate (read-number prompt (if (integerp current) current 7)))))
-    (unless (<= 0 n 15)
-      (user-error "Color is a number from 0 to 15"))
-    n))
+  "Read a VGA color for PROMPT.
+The echo area shows each hex digit in that color.  CURRENT is kept
+when it is a VGA index and the user presses RET."
+  (message "%s%s" prompt (ans--palette-key-line))
+  (let* ((ch (read-char-exclusive))
+         (n (cl-position (downcase ch) "0123456789abcdef")))
+    (cond
+     ((memq ch '(?\C-g ?\e)) (keyboard-quit))
+     ((and (eq ch ?\r) (integerp current) (<= 0 current 15)) current)
+     (n n)
+     (t (user-error "Press 0-9 or a-f")))))
+
+(defvar ans--edit-bar-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map [header-line down-mouse-1] #'ans-edit-bar-click)
+    (define-key map [header-line down-mouse-3] #'ans-edit-bar-click)
+    ;; The release is a second event.  Swallow it so one click acts once.
+    (define-key map [header-line mouse-1] #'ignore)
+    (define-key map [header-line mouse-3] #'ignore)
+    (define-key map [header-line mouse-4] #'ans-cycle-pen-foreground)
+    (define-key map [header-line mouse-5] #'ans-cycle-pen-foreground-back)
+    (define-key map [header-line M-mouse-4] #'ans-cycle-pen-background)
+    (define-key map [header-line M-mouse-5] #'ans-cycle-pen-background-back)
+    map)
+  "Mouse map for the edit bar.")
+
+(defun ans--bar-item (text &rest props)
+  "Return TEXT with the edit-bar keymap and PROPS."
+  (apply #'propertize text
+         'keymap ans--edit-bar-map
+         'local-map ans--edit-bar-map
+         'mouse-face 'highlight
+         props))
+
+(defun ans--edit-swatch (index fg bg)
+  "Return a clickable chip for VGA INDEX.
+FG and BG are the current pen colors, used to mark the chip."
+  (let ((hex (ans--hex (aref ans-palette index))))
+    (ans--bar-item
+     "  "
+     'face (list :background hex
+                 :box (list :line-width (if (or (= index fg) (= index bg)) 1 -1)
+                            :color (cond
+                                    ((= index fg) (ans--ink index))
+                                    ((= index bg) "#FFD700")
+                                    (t "#555555"))))
+     'help-echo (format "%s (%d).  Click: foreground.  Right-click: background."
+                        (aref ans-edit-vga-names index) index)
+     'ans-color index)))
+
+(defun ans--current-glyph-bank ()
+  "Return the drawing set shown on the edit bar.
+The result is a list of a name and twelve CP437 bytes, one for each
+function key from F1 through F12."
+  (nth (mod ans--glyph-bank (length ans-edit-glyph-banks))
+       ans-edit-glyph-banks))
+
+(defun ans--edit-bar ()
+  "Return the editing header: pen, colors, and F-key glyphs."
+  (let* ((fg ans--pen-fg)
+         (bg ans--pen-bg)
+         (bank (ans--current-glyph-bank))
+         (name (car bank))
+         (bytes (cdr bank))
+         (name-width (apply #'max (mapcar (lambda (item) (length (car item)))
+                                          ans-edit-glyph-banks)))
+         (chips nil)
+         (keys nil)
+         (n 1)
+         (bar nil))
+    (dotimes (i 16)
+      (push (ans--edit-swatch i (if (integerp fg) fg -1) (if (integerp bg) bg -1))
+            chips))
+    (dolist (byte bytes)
+      (push (ans--bar-item
+             (format "F%d%c" n (ans-cp437-char byte))
+             'help-echo (format "F%d inserts this glyph" n)
+             'ans-byte byte)
+            keys)
+      (setq n (1+ n)))
+    (setq bar
+          (concat
+           (propertize (format " %d,%d  " (1+ ans--cursor-row) (1+ ans--cursor-col))
+                       'help-echo "Cursor, counting from 1.  Arrow keys move.")
+           (ans--bar-item
+            "▓▓"
+            'face (list :foreground (ans--hex (ans-color-rgb fg))
+                        :background (ans--hex (ans-color-rgb bg)))
+            'help-echo "Current pen.  M-right cycles foreground.  M-up cycles background.  The wheel on this bar does too.")
+           (propertize (format " %s/%s%s  "
+                               (ans--vga-name fg)
+                               (ans--vga-name bg)
+                               (if ans--pen-underline " ul" ""))
+                       'help-echo "Foreground and background.")
+           (apply #'concat (nreverse chips))
+           "  "
+           (ans--bar-item
+            (concat name (make-string (- name-width (length name)) ?\s))
+            'help-echo (format "%s.  Click or M-n for the next drawing set.  Right-click or M-p for the previous." name)
+            'ans-bank 1)
+           " "
+           (mapconcat #'identity (nreverse keys) " ")))
+    ;; The wheel should work on the whole bar, including the gaps.
+    (add-text-properties 0 (length bar)
+                         (list 'keymap ans--edit-bar-map
+                               'local-map ans--edit-bar-map)
+                         bar)
+    bar))
+
+(defun ans-edit-bar-click (event)
+  "Handle a click on the edit bar from EVENT.
+A color chip sets the foreground, or the background on a right click.
+A function-key glyph is typed.  The set name changes drawing sets."
+  (interactive "e")
+  (ans--require-edit)
+  (let* ((pair (posn-string (event-start event)))
+         (str (car pair))
+         (idx (cdr pair))
+         (basic (event-basic-type event)))
+    (cond
+     ((or (null str) (not (integerp idx))) nil)
+     ((get-text-property idx 'ans-byte str)
+      (ans--insert-byte (get-text-property idx 'ans-byte str)))
+     ((get-text-property idx 'ans-color str)
+      (if (memq basic '(mouse-3 down-mouse-3))
+          (ans-set-pen-background (get-text-property idx 'ans-color str))
+        (ans-set-pen-foreground (get-text-property idx 'ans-color str))))
+     ((get-text-property idx 'ans-bank str)
+      (if (memq basic '(mouse-3 down-mouse-3))
+          (ans-previous-glyph-bank)
+        (ans-next-glyph-bank))))))
+
+(defun ans--insert-byte (byte)
+  "Replace the current cell with CP437 BYTE and move to the next cell."
+  (when (memq byte ans-stream-controls)
+    (user-error "That glyph cannot be stored in an ANSI stream"))
+  (when (>= ans--cursor-row ans-max-rows)
+    (user-error "ANSI screen is limited to %d rows" ans-max-rows))
+  (ans--change-cell ans--cursor-row ans--cursor-col (ans--pen-cell byte))
+  (ans--advance-cursor)
+  (ans--show-cursor))
 
 (defun ans-insert-char ()
   "Replace the current cell with the typed glyph and move to the next cell."
@@ -764,13 +954,67 @@ CURRENT is the value shown as the default."
          (byte (ans-cp437-byte char)))
     (unless byte
       (user-error "No CP437 glyph for `%c'" char))
-    (when (memq byte ans-stream-controls)
-      (user-error "That glyph cannot be stored in an ANSI stream"))
-    (when (>= ans--cursor-row ans-max-rows)
-      (user-error "ANSI screen is limited to %d rows" ans-max-rows))
-    (ans--change-cell ans--cursor-row ans--cursor-col (ans--pen-cell byte))
-    (ans--advance-cursor)
-    (ans--show-cursor)))
+    (ans--insert-byte byte)))
+
+(defun ans-insert-function-key ()
+  "Insert the glyph this function key shows on the edit bar."
+  (interactive)
+  (ans--require-edit)
+  (let* ((event last-command-event)
+         (basic (if (symbolp event) event (event-basic-type event)))
+         (name (and (symbolp basic) (symbol-name basic)))
+         (n (and name
+                 (string-match "\\`f\\([0-9]+\\)\\'" name)
+                 (string-to-number (match-string 1 name))))
+         (bytes (cdr (ans--current-glyph-bank)))
+         (byte (and n (<= 1 n (length bytes)) (nth (1- n) bytes))))
+    (unless byte
+      (user-error "No drawing glyph on that key"))
+    (ans--insert-byte byte)))
+
+(defun ans-next-glyph-bank ()
+  "Show the next F-key drawing set on the edit bar."
+  (interactive)
+  (ans--require-edit)
+  (setq ans--glyph-bank (mod (1+ ans--glyph-bank) (length ans-edit-glyph-banks)))
+  (force-mode-line-update)
+  (message "Drawing set %s" (car (ans--current-glyph-bank))))
+
+(defun ans-previous-glyph-bank ()
+  "Show the previous F-key drawing set on the edit bar."
+  (interactive)
+  (ans--require-edit)
+  (setq ans--glyph-bank (mod (1- ans--glyph-bank) (length ans-edit-glyph-banks)))
+  (force-mode-line-update)
+  (message "Drawing set %s" (car (ans--current-glyph-bank))))
+
+(defun ans-cycle-pen-foreground (&optional n)
+  "Cycle the pen foreground by N VGA colors.
+N defaults to 1.  A negative N cycles backward."
+  (interactive "p")
+  (ans--require-edit)
+  (setq ans--pen-fg (ans--cycle-palette ans--pen-fg (or n 1) 7))
+  (force-mode-line-update)
+  (message "Foreground %s" (ans--vga-name ans--pen-fg)))
+
+(defun ans-cycle-pen-foreground-back (&optional n)
+  "Cycle the pen foreground backward by N VGA colors."
+  (interactive "p")
+  (ans-cycle-pen-foreground (- (or n 1))))
+
+(defun ans-cycle-pen-background (&optional n)
+  "Cycle the pen background by N VGA colors.
+N defaults to 1.  A negative N cycles backward."
+  (interactive "p")
+  (ans--require-edit)
+  (setq ans--pen-bg (ans--cycle-palette ans--pen-bg (or n 1) 0))
+  (force-mode-line-update)
+  (message "Background %s" (ans--vga-name ans--pen-bg)))
+
+(defun ans-cycle-pen-background-back (&optional n)
+  "Cycle the pen background backward by N VGA colors."
+  (interactive "p")
+  (ans-cycle-pen-background (- (or n 1))))
 
 (defun ans-backward-delete-cell ()
   "Move to the previous cell and paint it with a space in the current pen."
@@ -881,7 +1125,7 @@ CURRENT is the value shown as the default."
   (ans--require-edit)
   (setq ans--pen-fg color)
   (ans--show-cursor)
-  (message "Foreground %s" (ans--color-label color)))
+  (message "Foreground %s" (ans--vga-name color)))
 
 (defun ans-set-pen-background (color)
   "Set the pen background to COLOR, a VGA index from 0 to 15."
@@ -890,13 +1134,14 @@ CURRENT is the value shown as the default."
   (ans--require-edit)
   (setq ans--pen-bg color)
   (ans--show-cursor)
-  (message "Background %s" (ans--color-label color)))
+  (message "Background %s" (ans--vga-name color)))
 
 (defun ans-toggle-pen-underline ()
   "Toggle underlining for cells typed from now on."
   (interactive)
   (ans--require-edit)
   (setq ans--pen-underline (not ans--pen-underline))
+  (force-mode-line-update)
   (message "Underline %s" (if ans--pen-underline "on" "off")))
 
 (defun ans-pick-pen ()
@@ -987,6 +1232,18 @@ leave the picture and the grid different."
     (define-key map (kbd "C-e") #'ans-end-of-line-cell)
     (define-key map (kbd "<home>") #'ans-beginning-of-line-cell)
     (define-key map (kbd "<end>") #'ans-end-of-line-cell)
+    ;; F1 through F12 type the glyphs on the edit bar.  In an ordinary
+    ;; buffer, F5 through F9 are reserved for the user.  Here they are
+    ;; drawing keys, and only while this minor mode is on.
+    (dotimes (i 12)
+      (define-key map (vector (intern (format "f%d" (1+ i))))
+                  #'ans-insert-function-key))
+    (define-key map (kbd "M-n") #'ans-next-glyph-bank)
+    (define-key map (kbd "M-p") #'ans-previous-glyph-bank)
+    (define-key map (kbd "M-<left>") #'ans-cycle-pen-foreground-back)
+    (define-key map (kbd "M-<right>") #'ans-cycle-pen-foreground)
+    (define-key map (kbd "M-<up>") #'ans-cycle-pen-background)
+    (define-key map (kbd "M-<down>") #'ans-cycle-pen-background-back)
     (define-key map [mouse-1] #'ans-mouse-set-cursor)
     map)
   "Keymap for `ans-edit-mode'.")
@@ -997,6 +1254,11 @@ Typed characters replace the cell under the cursor and use the pen.
 `C-c C-f' and `C-c C-b' set the pen colors.  `C-c C-p' copies the
 colors from the current cell.  `C-c C-u' toggles underline.  `C-c C-c'
 leaves this mode.
+
+The header line shows the cursor, the pen, the sixteen VGA colors,
+and the glyphs on F1 through F12.  Arrows move from cell to cell.
+`M-right' and `M-left' change the foreground.  `M-up' and `M-down'
+change the background.  `M-n' and `M-p' change the drawing set.
 
 While this mode is on, letters type glyphs.  Viewer commands are on
 the `C-c C-' prefix: `t' switches view, `i' toggles iCE colors, `s'
@@ -1018,7 +1280,7 @@ shows SAUCE, `w' sets the width, and `r' reloads the file."
               (min ans--cursor-col
                    (1- (max 1 (ans-grid-width ans--grid)))))
         (ans--redisplay)
-        (message "Editing.  C-c C-c leaves edit mode.  C-c C-f sets the foreground."))
+        (message "Editing.  Arrows move.  The header bar shows the pen and F1-F12.  C-c C-c leaves."))
     (remove-hook 'before-change-functions #'ans--reject-raw-edit t)
     (when (derived-mode-p 'ans-mode)
       (setq buffer-read-only t)
