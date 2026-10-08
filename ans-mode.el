@@ -1,10 +1,10 @@
-;;; ans-mode.el --- View and edit ANSI art and SAUCE metadata -*- lexical-binding: t -*-
+;;; ans-mode.el --- ANSI art editor and SAUCE metadata -*- lexical-binding: t -*-
 
 ;; Copyright (C) 2026 William Theesfeld <william@theesfeld.net>
 
 ;; Author: William Theesfeld <william@theesfeld.net>
 ;; Keywords: multimedia, faces
-;; Version: 0.3.0
+;; Version: 0.3.1
 ;; Package-Requires: ((emacs "28.1"))
 ;; URL: https://github.com/theesfeld/ans-mode
 
@@ -34,8 +34,10 @@
 ;; ANSiMation stream.
 ;;
 ;; An ANSiMation is shown as the canvas left after the whole stream.
-;; Blink is a color attribute, not an animation.  Pixels are square;
-;; the SAUCE aspect flag is reported and does not stretch the raster.
+;; With iCE colors on, blink becomes a bright background.  With iCE
+;; colors off, blink is kept and written back, and it is not animated.
+;; Pixels are square; the SAUCE aspect flag is reported and does not
+;; stretch the raster.
 ;;
 ;; Install from MELPA with `M-x package-install', or follow the README
 ;; for a GitHub checkout and for configuration.  The package has to be

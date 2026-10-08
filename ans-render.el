@@ -24,7 +24,9 @@
 ;; full 80-column row.
 ;;
 ;; Colors are the VGA palette.  Bold brightens foreground indexes 0-7.
-;; When iCE colors are on, blink brightens the background the same way.
+;; When iCE colors are on, blink brightens the background the same way
+;; and is not stored.  When iCE colors are off, blink stays on the cell
+;; and is written back as SGR 5.  The picture is not animated.
 ;; Bytes other than CR, LF, TAB, ESC, and SUB (0x1A) are CP437 glyphs,
 ;; including the classic control pictures.
 
@@ -104,7 +106,9 @@ A nil cell is a space with light gray on black."
   (if cell (aref cell 2) 0))
 
 (defun ans-cell-flags (cell)
-  "Attribute bits of CELL.  Bit 0 is underline.  Bit 1 is italic."
+  "Attribute bits of CELL.
+Bit 0 is underline.  Bit 1 is italic.  Bit 2 is blink, stored only
+when iCE colors are off."
   (if cell (aref cell 3) 0))
 
 (defun ans-cell-underline-p (cell)
@@ -114,6 +118,11 @@ A nil cell is a space with light gray on black."
 (defun ans-cell-italic-p (cell)
   "Non-nil when CELL is italic."
   (not (zerop (logand (ans-cell-flags cell) 2))))
+
+(defun ans-cell-blink-p (cell)
+  "Non-nil when CELL has the blink attribute.
+iCE colors store a bright background instead of this bit."
+  (not (zerop (logand (ans-cell-flags cell) 4))))
 
 (defun ans-cell-default-p (cell)
   "Non-nil when CELL is a light-gray space on black."
@@ -253,6 +262,10 @@ The grid's rows are vectors of cells.  Each cell is a vector
                (setq flags (logior flags 1)))
              (when italic
                (setq flags (logior flags 2)))
+             ;; iCE uses blink as the bright-background bit.  The blink
+             ;; attribute itself is kept only while iCE colors are off.
+             (when (and blink (not ice))
+               (setq flags (logior flags 4)))
              (vector char fore back flags)))
          (put (at-row at-col char)
            (when (and (>= at-row 0) (< at-row row-cap)
@@ -490,11 +503,13 @@ The grid's rows are vectors of cells.  Each cell is a vector
 
 (defun ans--style-bytes (fg bg flags)
   "Return an SGR sequence that selects FG, BG, and FLAGS.
-FLAGS bit 0 is underline.  Bit 1 is italic.  The sequence starts by
-resetting, so it does not depend on the previous cell."
+FLAGS bit 0 is underline.  Bit 1 is italic.  Bit 2 is blink.  The
+sequence starts by resetting, so it does not depend on the previous
+cell."
   (let ((parts (list 0))
         (underline (not (zerop (logand flags 1))))
-        (italic (not (zerop (logand flags 2)))))
+        (italic (not (zerop (logand flags 2))))
+        (blink (not (zerop (logand flags 4)))))
     (cond
      ((and (integerp fg) (<= 0 fg 7))
       (unless (= fg 7) (setq parts (append parts (list (+ 30 fg))))))
@@ -515,6 +530,7 @@ resetting, so it does not depend on the previous cell."
       (setq parts (append parts (list 48 2 (nth 0 bg) (nth 1 bg) (nth 2 bg))))))
     (when underline (setq parts (append parts (list 4))))
     (when italic (setq parts (append parts (list 3))))
+    (when blink (setq parts (append parts (list 5))))
     (with-temp-buffer
       (set-buffer-multibyte nil)
       (insert 27 ?\[)
@@ -563,8 +579,11 @@ column count is the grid width, so a short row does not wrap."
 
 (defun ans--sauce-for-save (grid artwork-length)
   "Update GRID's SAUCE record for an artwork of ARTWORK-LENGTH bytes.
-The saved file is ANSi.  Title, author, group, date, font, comments,
-and the spacing and aspect flags are kept.  Return the struct."
+The saved file is ANSi.  Title, author, group, date, font, and
+comments are kept.  Letter spacing and aspect stay in the flag.  The
+iCE bit follows the grid.  Reserved flag bits, TInfo3, and TInfo4 are
+zero.  FileSize is ARTWORK-LENGTH, which excludes the EOF byte and the
+SAUCE record.  Return the struct."
   (let ((sauce (or (ans-grid-sauce grid)
                    (ans-sauce--make
                     :version "00" :title "" :author "" :group ""
@@ -580,11 +599,17 @@ and the spacing and aspect flags are kept.  Return the struct."
     (setf (ans-sauce-file-type sauce) 1)
     (setf (ans-sauce-tinfo1 sauce) (ans-grid-width grid))
     (setf (ans-sauce-tinfo2 sauce) (ans-grid-height grid))
+    ;; ANSi TInfo3 and TInfo4 are unused.  A compliant record stores 0.
+    (setf (ans-sauce-tinfo3 sauce) 0)
+    (setf (ans-sauce-tinfo4 sauce) 0)
+    ;; Bits 1-4 are letter spacing and aspect.  Bits 5-7 are reserved.
+    ;; Bit 0 is the grid's iCE flag.
     (setf (ans-sauce-flags sauce)
-          (logior (logand (or (ans-sauce-flags sauce) 0) #xFE)
+          (logior (logand (or (ans-sauce-flags sauce) 0) #x1E)
                   (if (ans-grid-ice grid) 1 0)))
-    ;; The EOF byte is part of the file and is not part of SAUCE.
-    (setf (ans-sauce-file-size sauce) (1+ artwork-length))
+    ;; FileSize is the original artwork.  The EOF byte, comment block,
+    ;; and SAUCE record are appended after it.
+    (setf (ans-sauce-file-size sauce) artwork-length)
     (unless (ans-sauce-font sauce)
       (setf (ans-sauce-font sauce) "IBM VGA"))
     (unless (ans-sauce-title sauce) (setf (ans-sauce-title sauce) ""))

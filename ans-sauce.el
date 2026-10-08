@@ -18,10 +18,13 @@
 ;; Extensions) and the CP437 mapping used to display those strings.
 ;;
 ;; A SAUCE record is the last 128 bytes of the file, optionally
-;; preceded by a COMNT block.  Character files store the column count
+;; preceded by a COMNT block.  Character fields are CP437 and padded
+;; with spaces.  TInfoS, the font name, is a NUL-terminated string
+;; padded with binary zeros.  Character files store the column count
 ;; in TInfo1 and a row hint in TInfo2.  Flag bit 0 selects iCE colors
 ;; (bright backgrounds instead of blink).  Bits 1-2 select 8- or
-;; 9-pixel letter spacing.
+;; 9-pixel letter spacing.  Bits 3-4 select the aspect ratio.  Bits
+;; 5-7 are reserved.
 
 ;;; Code:
 
@@ -269,6 +272,21 @@ A character with no CP437 glyph is stored as `?'."
                 32)))
     (buffer-string)))
 
+(defun ans--zfield (text length)
+  "Return LENGTH bytes for the SAUCE ZString TEXT.
+CP437 bytes are followed by a NUL and binary zeros.  A value that
+fills LENGTH is stored without a terminating NUL.  A character with
+no CP437 glyph is stored as `?'."
+  (setq text (or text ""))
+  (with-temp-buffer
+    (set-buffer-multibyte nil)
+    (let ((n (min (length text) length)))
+      (dotimes (i n)
+        (insert (or (ans-cp437-byte (aref text i)) ??)))
+      (dotimes (_ (- length n))
+        (insert 0)))
+    (buffer-string)))
+
 (defun ans--date-field (date)
   "Return the 8-byte SAUCE date for DATE.
 DATE is YYYY-MM-DD, 8 raw characters, or nil."
@@ -324,7 +342,7 @@ row count, flags, and file type are stored as they stand."
               (ans--u16-bytes (or (ans-sauce-tinfo4 sauce) 0))
               count
               (or (ans-sauce-flags sauce) 0)
-              (ans--field (ans-sauce-font sauce) 22))
+              (ans--zfield (ans-sauce-font sauce) 22))
       (buffer-string))))
 
 (provide 'ans-sauce)

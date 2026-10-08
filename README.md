@@ -1,10 +1,10 @@
 # ans-mode
 
-`ans-mode` is an Emacs major mode for ANSI art. Open a `.ans` file and Emacs draws the picture: a VGA font raster, in the colors the file asked for, with the SAUCE title and author in the header line.
+`ans-mode` is an Emacs editor for ANSI art. Open a `.ans` file and Emacs draws the picture: a VGA font raster, in the colors the file asked for, with the SAUCE title and author in the header line.
 
 Press `t` for a Unicode text view of the same screen. That view can be searched and copied. Press `e` to edit the screen: typed characters replace the cell under the cursor. While you edit, the header line shows the pen, the sixteen VGA colors, and the glyphs on F1 through F12. Saving before you edit writes the original file bytes. Saving after you edit writes the screen you see, as ANSi, and keeps the SAUCE title, author, and comments.
 
-The picture is a still. An ANSiMation is the screen left after the whole stream has been drawn. Blink is kept as a color attribute.
+The picture is a still. An ANSiMation is the screen left after the whole stream has been drawn. With iCE colors on, blink is a bright background. With iCE colors off, blink stays in the file and the picture stays still.
 
 ## Requirements
 
@@ -248,9 +248,9 @@ Column count is capped at 4096.
 
 With no other instruction, the column count comes from the SAUCE record of a character file (ASCII, ANSi, or ANSiMation). A missing or zero width uses 80 columns.
 
-`w` asks for a new count for this buffer and draws again. `0` at that prompt, or a prefix argument (`C-u w`), clears the override and returns to SAUCE or 80.
+`w` asks for a new count for this buffer. Before you edit, the stream is read again at that width. After you edit, the grid changes width and the cells on the left of each row stay. `0` at that prompt, or a prefix argument (`C-u w`), clears the override and returns to SAUCE or 80. After an edit, that restore still resizes the grid you have.
 
-iCE colors turn blink into a bright background, which is what the SAUCE non-blink flag requests. The default follows that flag. A file with no SAUCE record leaves iCE off. `i` flips it for this buffer and draws again. The choice lasts until you toggle it again or kill the buffer. It is not saved as a customization.
+iCE colors turn blink into a bright background, which is what the SAUCE non-blink flag requests. The default follows that flag. A file with no SAUCE record leaves iCE off. `i` flips it for this buffer. Before you edit, the stream is read again, so blink and bright backgrounds trade places. After you edit, the cells keep the colors they have and the flag stored on save changes. The choice lasts until you toggle it again or kill the buffer. It is not saved as a customization.
 
 ## SAUCE
 
@@ -318,9 +318,9 @@ Typing replaces that cell and moves to the next one. At the right edge the curso
 | `C-c C-u` | Toggle underline for cells typed from now on. |
 | `C-c C-p` | Copy the current cell's colors into the pen. |
 | `C-c C-t` | Switch between the raster and the text view. |
-| `C-c C-i` | Toggle the iCE-colors flag. |
+| `C-c C-i` | Toggle the iCE-colors flag. After an edit, cells keep their colors. |
 | `C-c C-s` | Show the SAUCE record. |
-| `C-c C-w` | Set the column count. |
+| `C-c C-w` | Set the column count. After an edit, the grid is resized. |
 | `C-c C-r` | Reload the file from disk and discard edits. |
 | `C-c C-c` | Leave edit mode. `F1`–`F12` return to their usual commands. |
 
@@ -336,19 +336,33 @@ A glyph that has no CP437 byte is refused. Tab, line feed, carriage return, the 
 
 `C-x C-s` before you edit writes the original bytes to the visited file. An ANSiMation stays the original stream.
 
-`C-x C-s` after you edit writes the screen as an ANSi file: one row of CP437 and color codes at a time, then the SAUCE record. The title, author, group, date, font, comments, letter spacing, and aspect flag are kept. The column count, row count, and iCE flag match the screen you edited. The saved file is a still. An ANSiMation's original stream is replaced by that still when you save an edit.
+`C-x C-s` after you edit writes the screen as an ANSi file. Each row is CP437 and SGR color codes, then CR LF. An EOF byte (`0x1A`) follows the artwork, then a COMNT block when the file has comments, then the 128-byte SAUCE record.
+
+The saved record is SAUCE version 00, Character / ANSi:
+
+- Title, author, group, date, and comments stay. Those fields are CP437 and padded with spaces.
+- The font name stays. It is stored as a NUL-padded string of 22 bytes. A new file uses `IBM VGA`.
+- The column count and the row count match the screen. TInfo3 and TInfo4 are 0.
+- Letter spacing and the aspect flag stay. Reserved flag bits are 0. The iCE bit matches the screen.
+- FileSize is the length of the artwork. The EOF byte and the SAUCE record are appended after that artwork.
+
+The saved file is a still. An ANSiMation's original stream is replaced by that still when you save an edit. With iCE colors off, a blinking cell is written back as SGR 5. With iCE colors on, that blink is the bright background already shown.
 
 `g` outside edit mode, and `C-c C-r` while editing, read the file from disk again and discard edits. Width, iCE, view, and scale choices you made in the buffer stay in place.
 
 ## What the drawing understands
 
-The stream is a CP437 screen. Cursor movement, erase, and a saved cursor write into a fixed number of columns. A character in the last column stays on that row until the next printable character. CR and LF cancel that pending wrap, so a full 80-column line is not followed by a blank one.
+The stream is a CP437 screen. Cursor movement, erase, and a saved cursor write into a fixed number of columns. A character in the last column stays on that row until the next printable character. CR and LF cancel that pending wrap, so a full 80-column line is not followed by a blank one. LF also moves to the first column of the next row.
 
-Bytes other than CR, LF, TAB, ESC, and SUB (`0x1A`) are CP437 glyphs, including the classic control pictures. TAB advances to the next eighth column.
+Bytes other than CR, LF, TAB, ESC, and SUB (`0x1A`) are CP437 glyphs, including the classic control pictures. TAB advances to the next eighth column. SUB ends the stream.
 
-Colors are the VGA palette. Bold brightens foreground indexes 0–7. With iCE colors on, blink brightens the background the same way. The renderer also accepts the usual SGR attributes (reset, bold, italic, underline, blink, inverse, conceal, and the bright 90–97 / 100–107 indexes), 256-color and 24-bit color, and PabloDraw 24-bit color (`CSI ... t`).
+Colors are the VGA palette. Bold brightens foreground indexes 0–7. With iCE colors on, blink brightens the background the same way. With iCE colors off, blink stays on the cell and a later save writes SGR 5. The picture stays still either way. The renderer also accepts the usual SGR attributes (reset, bold, italic, underline, blink, inverse, conceal, and the bright 90–97 / 100–107 indexes), 256-color and 24-bit color (`38;5`, `38;2`, `48;5`, `48;2`), and PabloDraw 24-bit color (`CSI 0;R;G;B t` for the background and `CSI 1;R;G;B t` for the foreground).
 
 Cursor commands cover `CUP`, up, down, forward, back, horizontal and vertical position, save and restore (`CSI s` / `CSI u` and `ESC 7` / `ESC 8`), erase line, erase display, and `ESC c` to reset.
+
+An ANSiMation is the still left after the whole stream. Saving an edit writes that still as ANSi, file type 1.
+
+This mode reads and writes CP437 ANSi streams and their SAUCE records. SAUCE follows [revision 00.5](https://www.acid.org/info/sauce/sauce.htm): version `00`, space-padded character fields, a NUL-padded font name, and the ANSi flag bits for iCE colors, letter spacing, and aspect. The row count in an ANSi record is a hint. The drawn height comes from the stream. A width of 0 uses 80 columns. PCBoard, Avatar, RIP, TundraDraw palettes, BinaryText, and XBin are outside this reader. Amiga and Topaz names use the VGA 8×16 glyphs. The aspect flag is reported in the SAUCE buffer, and the raster keeps square pixels.
 
 ## License
 

@@ -33,7 +33,7 @@ A number is one byte.  A string is copied byte by byte."
 (defun ans-test-sauce (payload &rest spec)
   "Append a SAUCE record to PAYLOAD.
 SPEC is a plist: :title :author :group :date :width :height :flags
-:font :comments :file-type :data-type :eof."
+:font :comments :file-type :data-type :tinfo3 :tinfo4 :eof."
   (let* ((comments (plist-get spec :comments))
          (date (replace-regexp-in-string "-" "" (or (plist-get spec :date) "")))
          (block nil))
@@ -57,8 +57,8 @@ SPEC is a plist: :title :author :group :date :width :height :flags
                   (or (plist-get spec :file-type) 1)
                   (ans-test-u16 (or (plist-get spec :width) 0))
                   (ans-test-u16 (or (plist-get spec :height) 0))
-                  0 0
-                  0 0
+                  (ans-test-u16 (or (plist-get spec :tinfo3) 0))
+                  (ans-test-u16 (or (plist-get spec :tinfo4) 0))
                   (length comments)
                   (or (plist-get spec :flags) 0)
                   (ans-test-pad (or (plist-get spec :font) "") 22))))))
@@ -175,12 +175,38 @@ SPEC is a plist: :title :author :group :date :width :height :flags
 (ert-deftest ans-render-ice ()
   (let* ((seq (ans-test-bytes #x1b "[31;45;5mX"))
          (on (ans-render-bytes seq :ice 'on))
-         (off (ans-render-bytes seq :ice 'off)))
+         (off (ans-render-bytes seq :ice 'off))
+         (cleared (ans-render-bytes
+                   (ans-test-bytes #x1b "[5mA" #x1b "[25mB") :ice 'off)))
     (should (= (ans-cell-fg (ans-grid-cell on 0 0)) 1))
     (should (= (ans-cell-bg (ans-grid-cell on 0 0)) 13))
+    (should-not (ans-cell-blink-p (ans-grid-cell on 0 0)))
     (should (= (ans-cell-bg (ans-grid-cell off 0 0)) 5))
+    (should (ans-cell-blink-p (ans-grid-cell off 0 0)))
     (should (ans-grid-ice on))
-    (should-not (ans-grid-ice off))))
+    (should-not (ans-grid-ice off))
+    (should (ans-cell-blink-p (ans-grid-cell cleared 0 0)))
+    (should-not (ans-cell-blink-p (ans-grid-cell cleared 0 1)))))
+
+(ert-deftest ans-render-blink-roundtrip ()
+  "Blink is written back only when iCE colors are off."
+  (let* ((seq (ans-test-bytes #x1b "[31;45;5mX"))
+         (off (ans-render-bytes seq :ice 'off))
+         (on (ans-render-bytes seq :ice 'on))
+         (off-bytes (ans-encode-grid off))
+         (on-bytes (ans-encode-grid on))
+         (off-again (ans-render-bytes off-bytes))
+         (on-again (ans-render-bytes on-bytes)))
+    (should (string-search (ans-test-bytes #x1b "[0;31;45;5m") off-bytes))
+    (should (string-search (ans-test-bytes #x1b "[0;31;105m") on-bytes))
+    (should-not (string-search (ans-test-bytes #x1b "[0;31;105;5m") on-bytes))
+    (should (ans-cell-blink-p (ans-grid-cell off-again 0 0)))
+    (should (= (ans-cell-bg (ans-grid-cell off-again 0 0)) 5))
+    (should (= (ans-cell-fg (ans-grid-cell off-again 0 0)) 1))
+    (should-not (ans-grid-ice off-again))
+    (should-not (ans-cell-blink-p (ans-grid-cell on-again 0 0)))
+    (should (= (ans-cell-bg (ans-grid-cell on-again 0 0)) 13))
+    (should (ans-grid-ice on-again))))
 
 (ert-deftest ans-render-truecolor-and-256 ()
   (let ((grid (ans-render-bytes
@@ -341,6 +367,77 @@ SPEC is a plist: :title :author :group :date :width :height :flags
   (should (= (ans-cp437-byte (ans-cp437-char #xDB)) #xDB))
   (should (= (ans-cp437-byte (ans-cp437-char 127)) 127))
   (should-not (ans-cp437-byte ?λ)))
+
+(ert-deftest ans-sauce-font-is-a-zstring ()
+  "The font field is NUL-padded, and character fields stay space-padded."
+  (let* ((full (make-string 22 ?Q))
+         (sauce (ans-sauce--make
+                 :version "00" :title "Winter" :author "Ada" :group "ACiD"
+                 :date "1996-04-01" :file-size 2 :data-type 1 :file-type 1
+                 :tinfo1 40 :tinfo2 1 :tinfo3 9 :tinfo4 9
+                 :comments '("Hello") :flags 1 :font "IBM VGA" :data-end 0))
+         (bytes (ans-sauce-encode sauce))
+         (origin (- (length bytes) 128)))
+    (should (= (aref bytes 0) 26))
+    (should (equal (substring bytes (+ origin 106) (+ origin 128))
+                   (ans-test-bytes "IBM VGA"
+                                   0 0 0 0 0 0 0 0 0 0 0 0 0 0 0)))
+    (should (= (aref bytes (+ origin 7 6)) 32))
+    (should (= (aref bytes 11) 32))
+    (should (equal (ans-sauce-font (ans-sauce-parse bytes)) "IBM VGA"))
+    (should (equal (ans-sauce-title (ans-sauce-parse bytes)) "Winter"))
+    (setf (ans-sauce-font sauce) full)
+    (let* ((wide (ans-sauce-encode sauce))
+           (wide-origin (- (length wide) 128)))
+      (should (equal (substring wide (+ wide-origin 106) (+ wide-origin 128))
+                     (ans-test-bytes full)))
+      (should (equal (ans-sauce-font (ans-sauce-parse wide)) full)))
+    (setf (ans-sauce-font sauce) "")
+    (let* ((empty (ans-sauce-encode sauce))
+           (empty-origin (- (length empty) 128)))
+      (should (equal (substring empty (+ empty-origin 106) (+ empty-origin 128))
+                     (apply #'ans-test-bytes (make-list 22 0))))
+      (should (equal (ans-sauce-font (ans-sauce-parse empty)) "")))
+    (let ((legacy (ans-test-sauce (ans-test-bytes "Q")
+                                  :font "IBM VGA" :eof t)))
+      (should (equal (ans-sauce-font (ans-sauce-parse legacy)) "IBM VGA")))))
+
+(ert-deftest ans-encode-sauce-follows-spec ()
+  "An edited ANSi record matches the SAUCE layout for character files."
+  (let* ((source (ans-test-sauce
+                  (ans-test-bytes "Hi\r\n")
+                  :title "Winter" :author "Ada" :group "ACiD"
+                  :date "1996-04-01" :width 40 :height 3
+                  :tinfo3 16 :tinfo4 99
+                  :flags #xF5 :font "IBM VGA" :eof t
+                  :comments '("Hello")))
+         (parsed (ans-sauce-parse source))
+         (grid (ans-render-bytes source))
+         (bytes (ans-encode-grid grid))
+         (sauce (ans-sauce-parse bytes))
+         (origin (- (length bytes) 128)))
+    (should (= (ans-sauce-tinfo3 parsed) 16))
+    (should (= (ans-sauce-tinfo4 parsed) 99))
+    (should (= (logand (ans-sauce-flags parsed) #xE0) #xE0))
+    (should (= (ans-sauce-file-size sauce) (ans-sauce-data-end sauce)))
+    (should (= (aref bytes (ans-sauce-data-end sauce)) 26))
+    (should (= (ans-sauce-flags sauce) #x15))
+    (should (ans-sauce-ice sauce))
+    (should (eq (ans-sauce-spacing sauce) 9))
+    (should (equal (ans-sauce-aspect sauce) "square pixels"))
+    (should (= (ans-sauce-tinfo3 sauce) 0))
+    (should (= (ans-sauce-tinfo4 sauce) 0))
+    (should (equal (substring bytes (+ origin 106) (+ origin 128))
+                   (ans-test-bytes "IBM VGA"
+                                   0 0 0 0 0 0 0 0 0 0 0 0 0 0 0)))
+    (should (= (aref bytes (+ origin 7 6)) 32))
+    (should (equal (ans-sauce-title sauce) "Winter"))
+    (should (equal (ans-sauce-comments sauce) '("Hello")))
+    (setf (ans-grid-ice grid) nil)
+    (let ((plain (ans-sauce-parse (ans-encode-grid grid))))
+      (should (= (ans-sauce-flags plain) #x14))
+      (should-not (ans-sauce-ice plain))
+      (should (eq (ans-sauce-spacing plain) 9)))))
 
 (ert-deftest ans-encode-grid-roundtrip ()
   (let* ((source (ans-test-sauce
