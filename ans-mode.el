@@ -1,10 +1,10 @@
-;;; ans-mode.el --- View ANSI art and SAUCE metadata -*- lexical-binding: t -*-
+;;; ans-mode.el --- View and edit ANSI art and SAUCE metadata -*- lexical-binding: t -*-
 
 ;; Copyright (C) 2026 William Theesfeld <william@theesfeld.net>
 
 ;; Author: William Theesfeld <william@theesfeld.net>
 ;; Keywords: multimedia, faces
-;; Version: 0.1.0
+;; Version: 0.2.0
 ;; Package-Requires: ((emacs "28.1"))
 ;; URL: https://github.com/theesfeld/ans-mode
 
@@ -25,8 +25,13 @@
 ;; default view is a raster of the VGA font (8x16, or 8x8 when SAUCE
 ;; names a VGA50 font).  Other SAUCE font names, including Amiga and
 ;; Topaz, use the same 8x16 glyphs.  `t' switches to Unicode text with
-;; the same colors, which can be searched and copied.  Saving writes
-;; the original bytes back.
+;; the same colors, which can be searched and copied.
+;;
+;; `e' edits the screen.  Typed characters replace the cell under the
+;; cursor and use the current pen.  Saving an edited screen writes
+;; ANSi for that grid and keeps the SAUCE title, author, and comments.
+;; Saving before any edit writes the original bytes, including an
+;; ANSiMation stream.
 ;;
 ;; An ANSiMation is shown as the canvas left after the whole stream.
 ;; Blink is a color attribute, not an animation.  Pixels are square;
@@ -38,6 +43,7 @@
 ;; selects the major mode, and the autoloads register .ans as raw bytes.
 ;;
 ;; Keys:
+;;   e        edit the screen
 ;;   t        toggle raster and text
 ;;   + / -    scale the raster
 ;;   0        reset the scale
@@ -99,6 +105,18 @@ The raster does not use this font."
 (defvar-local ans--width-override nil)
 (defvar-local ans--ice-override nil)
 (defvar-local ans--image-skip nil)
+(defvar-local ans--edited nil
+  "Non-nil when the screen has been edited and should be saved as ANSi.")
+(defvar-local ans--cursor-row 0
+  "Cursor row while editing, counting from 0.")
+(defvar-local ans--cursor-col 0
+  "Cursor column while editing, counting from 0.")
+(defvar-local ans--pen-fg 7
+  "Foreground palette index, 256-color index, or (R G B) list.")
+(defvar-local ans--pen-bg 0
+  "Background palette index, 256-color index, or (R G B) list.")
+(defvar-local ans--pen-underline nil
+  "Non-nil when the pen underlines new cells.")
 
 (defun ans--capture-bytes ()
   "Return the buffer contents as raw bytes."
@@ -263,9 +281,44 @@ CELL-WIDTH is 8 or 9.  FONT defaults from the SAUCE font name."
             ans--ppm-key key))
     ans--ppm))
 
+(defun ans--color-label (color)
+  "Short label for COLOR, a palette index or an (R G B) list."
+  (cond
+   ((integerp color) (format "%d" color))
+   ((and (consp color) (nth 2 color))
+    (apply #'format "#%02X%02X%02X" color))
+   (t "?")))
+
+(defun ans--ppm-with-cursor (ppm grid)
+  "Return PPM with the edit cursor inverted, or PPM when it has no cell."
+  (let ((row ans--cursor-row)
+        (column ans--cursor-col))
+    (if (or (not ppm)
+            (< row 0) (>= row (ans-grid-height grid))
+            (< column 0) (>= column (ans-grid-width grid)))
+        ppm
+      (let* ((sauce (ans-grid-sauce grid))
+             (cell-width (ans--cell-width sauce))
+             (glyph-height (ans-vga-height (ans--vga-for-sauce sauce)))
+             (px-w (* (ans-grid-width grid) cell-width))
+             (copy (copy-sequence ppm))
+             (x0 (* column cell-width))
+             (y0 (* row glyph-height)))
+        (string-match "\\`P6\n[0-9]+ [0-9]+\n255\n" copy)
+        (let ((base (match-end 0)))
+          (dotimes (dy glyph-height)
+            (dotimes (dx cell-width)
+              (let ((index (+ base (* (+ (* (+ y0 dy) px-w) (+ x0 dx)) 3))))
+                (aset copy index (- 255 (aref copy index)))
+                (aset copy (1+ index) (- 255 (aref copy (1+ index))))
+                (aset copy (+ index 2) (- 255 (aref copy (+ index 2))))))))
+        copy))))
+
 (defun ans--insert-image (grid)
   "Insert GRID as one scaled VGA raster."
   (let ((ppm (ans--ensure-ppm grid)))
+    (when (bound-and-true-p ans-edit-mode)
+      (setq ppm (ans--ppm-with-cursor ppm grid)))
     (insert-image
      (create-image ppm 'pbm t
                    :scale (max 1 (or ans--scale 1))
@@ -315,13 +368,23 @@ CELL-WIDTH is 8 or 9.  FONT defaults from the SAUCE font name."
                             (length comments)
                             (if (= (length comments) 1) "" "s")))
                   (when (ans-grid-truncated ans--grid) "truncated")
-                  ans--image-skip)))
+                  ans--image-skip
+                  (when (bound-and-true-p ans-edit-mode)
+                    (format "edit %d,%d  pen %s/%s%s"
+                            (1+ ans--cursor-row)
+                            (1+ ans--cursor-col)
+                            (ans--color-label ans--pen-fg)
+                            (ans--color-label ans--pen-bg)
+                            (if ans--pen-underline " ul" ""))))))
       (mapconcat #'identity (delq nil parts) "  ·  "))))
 
 (defun ans--redisplay ()
   "Draw `ans--grid' into the current buffer."
   (let ((inhibit-read-only t)
-        (inhibit-modification-hooks t))
+        (inhibit-modification-hooks t)
+        ;; The grid is the document.  Cell edits keep their own undo
+        ;; entries, so the redraw must not record a buffer-text change.
+        (buffer-undo-list t))
     (erase-buffer)
     (set-buffer-multibyte t)
     (setq ans--image-skip nil)
@@ -339,8 +402,10 @@ CELL-WIDTH is 8 or 9.  FONT defaults from the SAUCE font name."
               (message "Showing text: %s" reason))
           (setq cursor-type nil)
           (ans--insert-image ans--grid))))
-    (goto-char (point-min))
-    (set-buffer-modified-p nil)))
+    (if (bound-and-true-p ans-edit-mode)
+        (ans--goto-cursor)
+      (goto-char (point-min)))
+    (set-buffer-modified-p (and ans--edited t))))
 
 (defun ans--show ()
   "Render `ans--raw' and display it."
@@ -364,13 +429,19 @@ CELL-WIDTH is 8 or 9.  FONT defaults from the SAUCE font name."
       (face-remap-add-relative 'default :family ans-text-font))))
 
 (defun ans--write-original ()
-  "Write the original ANSI bytes back to the visited file."
+  "Write this ANSI buffer back to the visited file.
+An edited screen is encoded as ANSi.  An unedited buffer writes the
+bytes that were loaded, so an ANSiMation stream stays intact."
   (unless buffer-file-name
     (user-error "No file associated with this buffer"))
   (unless ans--raw
     (user-error "Original ANSI bytes are missing"))
+  (when ans--edited
+    (setq ans--raw (ans-encode-grid ans--grid)
+          ans--edited nil))
   (let ((coding-system-for-write 'no-conversion))
     (write-region ans--raw nil buffer-file-name nil 'silent))
+  (set-buffer-modified-p nil)
   t)
 
 (defun ans--revert (&rest _)
@@ -386,7 +457,10 @@ CELL-WIDTH is 8 or 9.  FONT defaults from the SAUCE font name."
     (setq ans--raw (ans--capture-bytes)
           ans--grid nil
           ans--ppm nil
-          ans--ppm-key nil)
+          ans--ppm-key nil
+          ans--edited nil
+          ans--cursor-row 0
+          ans--cursor-col 0)
     (ans--show)
     (set-visited-file-modtime)
     (set-buffer-modified-p nil)))
@@ -399,11 +473,20 @@ CELL-WIDTH is 8 or 9.  FONT defaults from the SAUCE font name."
   (ans--redisplay))
 
 (defun ans-toggle-ice ()
-  "Toggle iCE colors and draw the file again."
+  "Toggle iCE colors and draw the file again.
+After an edit, the cells keep their colors and the SAUCE flag changes.
+Before an edit, the file is interpreted again."
   (interactive)
   (ans--require-buffer)
-  (setq ans--ice-override (if (ans-grid-ice ans--grid) 'off 'on))
-  (ans--show)
+  (if ans--edited
+      (progn
+        (setf (ans-grid-ice ans--grid) (not (ans-grid-ice ans--grid)))
+        (setq ans--ice-override (if (ans-grid-ice ans--grid) 'on 'off)
+              ans--ppm nil
+              ans--ppm-key nil)
+        (ans--redisplay))
+    (setq ans--ice-override (if (ans-grid-ice ans--grid) 'off 'on))
+    (ans--show))
   (message "iCE colors %s" (if (ans-grid-ice ans--grid) "on" "off")))
 
 (defun ans-set-width (width)
@@ -418,8 +501,19 @@ A prefix argument, or WIDTH 0, follows SAUCE or uses 80."
   (ans--require-buffer)
   (when (and width (or (< width 0) (> width ans-max-columns)))
     (user-error "Columns must be 0 to %d" ans-max-columns))
-  (setq ans--width-override (and width (> width 0) width))
-  (ans--show))
+  (if ans--edited
+      (let* ((sauce (ans-grid-sauce ans--grid))
+             (columns (or (and width (> width 0) width)
+                          (and sauce (ans-sauce-columns sauce))
+                          80)))
+        (ans-grid-set-width ans--grid columns)
+        (setq ans--width-override columns
+              ans--cursor-col (min ans--cursor-col (1- columns))
+              ans--ppm nil
+              ans--ppm-key nil)
+        (ans--redisplay))
+    (setq ans--width-override (and width (> width 0) width))
+    (ans--show)))
 
 (defun ans--adjust-scale (delta)
   "Add DELTA to the raster scale, keeping it between 1 and 8."
@@ -521,9 +615,419 @@ A prefix argument, or WIDTH 0, follows SAUCE or uses 80."
               (princ (format "  %s\n" comment)))
           (princ "  (none)\n"))))))
 
+(defun ans--cell-at (row column)
+  "Return the cell at ROW and COLUMN, or nil when that row is absent."
+  (when (and ans--grid
+             (>= row 0) (< row (ans-grid-height ans--grid))
+             (>= column 0) (< column (ans-grid-width ans--grid)))
+    (ans-grid-cell ans--grid row column)))
+
+(defun ans--cell-position (row column)
+  "Return the buffer position of ROW and COLUMN in the text view."
+  (let ((width (ans-grid-width ans--grid))
+        (height (ans-grid-height ans--grid)))
+    (if (or (<= height 0) (>= row height))
+        (point-max)
+      (+ (point-min)
+         (* row (1+ width))
+         (max 0 (min column (1- width)))))))
+
+(defun ans--goto-cursor ()
+  "Move point to the edit cursor in the text view."
+  (goto-char (ans--cell-position ans--cursor-row ans--cursor-col)))
+
+(defun ans--show-cursor ()
+  "Show the edit cursor in the current view."
+  (if (eq ans--view 'image)
+      (ans--redisplay)
+    (ans--goto-cursor)))
+
+(defun ans--move-cursor (row column)
+  "Move the edit cursor to ROW and COLUMN."
+  (setq ans--cursor-row row ans--cursor-col column)
+  (ans--show-cursor))
+
+(defun ans--replace-cell-text (row column)
+  "Update the text-view glyph at ROW and COLUMN from the grid."
+  (let* ((cells (aref (ans-grid-rows ans--grid) row))
+         (start (ans--cell-position row 0))
+         (cell (aref cells column))
+         (inhibit-read-only t)
+         (inhibit-modification-hooks t)
+         ;; Cell edits undo through `ans--restore-screen'.  The redraw
+         ;; is not a separate change to the document.
+         (buffer-undo-list t))
+    (goto-char (+ start column))
+    (delete-char 1)
+    (insert (ans-cp437-char (ans-cell-char cell)))
+    (remove-text-properties start (+ start (length cells))
+                            '(face nil font-lock-face nil))
+    (ans--paint-line start cells)))
+
+(declare-function undo-auto--undoable-change "simple" ())
+
+(defun ans--change-cell (row column cell)
+  "Store CELL at ROW and COLUMN, draw it, and record undo."
+  (let* ((height (ans-grid-height ans--grid))
+         (grew (or (= height 0) (>= row height)))
+         (was-edited ans--edited))
+    (when (eq buffer-undo-list t)
+      (setq buffer-undo-list nil))
+    (undo-boundary)
+    (push (list 'apply 'ans--restore-screen
+                row column (ans--cell-at row column) height was-edited)
+          buffer-undo-list)
+    (ans-grid-set-cell ans--grid row column cell)
+    (setq ans--edited t
+          ans--ppm nil
+          ans--ppm-key nil)
+    (if (and (eq ans--view 'text) (not grew))
+        (ans--replace-cell-text row column)
+      (ans--redisplay))
+    (set-buffer-modified-p t)
+    ;; The redraw hides the buffer change from Emacs, which would
+    ;; otherwise leave the next `undo' with no boundary to stop at.
+    (undo-auto--undoable-change)))
+
+(defun ans--restore-screen (row column cell height edited)
+  "Undo helper.  Restore CELL at ROW, COLUMN and the screen HEIGHT.
+EDITED is the previous value of `ans--edited'."
+  (let ((redo-cell (ans--cell-at row column))
+        (redo-height (ans-grid-height ans--grid))
+        (redo-edited ans--edited))
+    (push (list 'apply 'ans--restore-screen
+                row column redo-cell redo-height redo-edited)
+          buffer-undo-list)
+    (while (< (ans-grid-height ans--grid) (max height (if cell (1+ row) height)))
+      (ans-grid-set-cell ans--grid (ans-grid-height ans--grid) 0 nil))
+    (when (and cell (< row (ans-grid-height ans--grid)))
+      (ans-grid-set-cell ans--grid row column cell))
+    (when (and (null cell) (< row (ans-grid-height ans--grid)))
+      (ans-grid-set-cell ans--grid row column nil))
+    (when (< height (ans-grid-height ans--grid))
+      (ans-grid-set-height ans--grid height))
+    (setq ans--cursor-row (if (> height 0) (min row (1- height)) 0)
+          ans--cursor-col column
+          ans--edited edited
+          ans--ppm nil
+          ans--ppm-key nil)
+    (ans--redisplay)
+    (set-buffer-modified-p (and edited t))
+    (undo-auto--undoable-change)))
+
+(defun ans--extend-to-cursor ()
+  "Add an empty row when the cursor has moved past the last row."
+  (when (>= ans--cursor-row (ans-grid-height ans--grid))
+    (ans--change-cell ans--cursor-row 0 nil)))
+
+(defun ans--advance-cursor ()
+  "Move the cursor to the next cell, wrapping at the right edge."
+  (if (< ans--cursor-col (1- (ans-grid-width ans--grid)))
+      (setq ans--cursor-col (1+ ans--cursor-col))
+    (if (>= (1+ ans--cursor-row) ans-max-rows)
+        (message "Last cell")
+      (setq ans--cursor-col 0
+            ans--cursor-row (1+ ans--cursor-row)))))
+
+(defun ans--require-edit ()
+  "Signal a user error unless the screen is being edited."
+  (ans--require-buffer)
+  (unless (bound-and-true-p ans-edit-mode)
+    (user-error "Press e to edit this screen")))
+
+(defun ans--event-character ()
+  "Return the character that invoked this command."
+  (cond
+   ((characterp last-command-event) last-command-event)
+   ((and (eventp last-command-event)
+         (characterp (event-basic-type last-command-event)))
+    (event-basic-type last-command-event))
+   (t (user-error "Not a character"))))
+
+(defun ans--pen-cell (byte)
+  "Return a cell for CP437 BYTE using the current pen."
+  (ans-make-cell byte ans--pen-fg ans--pen-bg (if ans--pen-underline 1 0)))
+
+(defun ans--read-palette (prompt current)
+  "Read a VGA palette index, prompting with PROMPT.
+CURRENT is the value shown as the default."
+  (let ((n (truncate (read-number prompt (if (integerp current) current 7)))))
+    (unless (<= 0 n 15)
+      (user-error "Color is a number from 0 to 15"))
+    n))
+
+(defun ans-insert-char ()
+  "Replace the current cell with the typed glyph and move to the next cell."
+  (interactive)
+  (ans--require-edit)
+  (let* ((char (ans--event-character))
+         (byte (ans-cp437-byte char)))
+    (unless byte
+      (user-error "No CP437 glyph for `%c'" char))
+    (when (memq byte ans-stream-controls)
+      (user-error "That glyph cannot be stored in an ANSI stream"))
+    (when (>= ans--cursor-row ans-max-rows)
+      (user-error "ANSI screen is limited to %d rows" ans-max-rows))
+    (ans--change-cell ans--cursor-row ans--cursor-col (ans--pen-cell byte))
+    (ans--advance-cursor)
+    (ans--show-cursor)))
+
+(defun ans-backward-delete-cell ()
+  "Move to the previous cell and paint it with a space in the current pen."
+  (interactive)
+  (ans--require-edit)
+  (cond
+   ((> ans--cursor-col 0)
+    (setq ans--cursor-col (1- ans--cursor-col)))
+   ((> ans--cursor-row 0)
+    (setq ans--cursor-row (1- ans--cursor-row)
+          ans--cursor-col (1- (ans-grid-width ans--grid))))
+   (t (user-error "First cell")))
+  (ans--change-cell ans--cursor-row ans--cursor-col (ans--pen-cell 32))
+  (ans--show-cursor))
+
+(defun ans-newline-cell ()
+  "Move the cursor to the first column of the next row."
+  (interactive)
+  (ans--require-edit)
+  (if (>= (1+ ans--cursor-row) ans-max-rows)
+      (message "Last row")
+    (setq ans--cursor-row (1+ ans--cursor-row)
+          ans--cursor-col 0)
+    (ans--extend-to-cursor)
+    (ans--show-cursor)))
+
+(defun ans-forward-cell (&optional n)
+  "Move the cursor N cells to the right, wrapping onto the next row."
+  (interactive "p")
+  (ans--require-edit)
+  (dotimes (_ (max 1 (or n 1)))
+    (if (< ans--cursor-col (1- (ans-grid-width ans--grid)))
+        (setq ans--cursor-col (1+ ans--cursor-col))
+      (if (>= (1+ ans--cursor-row) ans-max-rows)
+          (message "Last cell")
+        (setq ans--cursor-col 0
+              ans--cursor-row (1+ ans--cursor-row))
+        (ans--extend-to-cursor))))
+  (ans--show-cursor))
+
+(defun ans-backward-cell (&optional n)
+  "Move the cursor N cells to the left, wrapping onto the previous row."
+  (interactive "p")
+  (ans--require-edit)
+  (dotimes (_ (max 1 (or n 1)))
+    (cond
+     ((> ans--cursor-col 0)
+      (setq ans--cursor-col (1- ans--cursor-col)))
+     ((> ans--cursor-row 0)
+      (setq ans--cursor-row (1- ans--cursor-row)
+            ans--cursor-col (1- (ans-grid-width ans--grid))))
+     (t (message "First cell"))))
+  (ans--show-cursor))
+
+(defun ans-previous-line-cell (&optional n)
+  "Move the cursor N rows up, staying in this column."
+  (interactive "p")
+  (ans--require-edit)
+  (setq ans--cursor-row (max 0 (- ans--cursor-row (max 1 (or n 1)))))
+  (ans--show-cursor))
+
+(defun ans-next-line-cell (&optional n)
+  "Move the cursor N rows down, adding a row when the cursor passes the end."
+  (interactive "p")
+  (ans--require-edit)
+  (let ((target (+ ans--cursor-row (max 1 (or n 1)))))
+    (when (>= target ans-max-rows)
+      (setq target (1- ans-max-rows))
+      (message "Last row"))
+    (while (< ans--cursor-row target)
+      (setq ans--cursor-row (1+ ans--cursor-row))
+      (ans--extend-to-cursor)))
+  (ans--show-cursor))
+
+(defun ans-beginning-of-line-cell ()
+  "Move the cursor to the first column of this row."
+  (interactive)
+  (ans--require-edit)
+  (ans--move-cursor ans--cursor-row 0))
+
+(defun ans-end-of-line-cell ()
+  "Move the cursor to the last drawn cell on this row."
+  (interactive)
+  (ans--require-edit)
+  (let ((column 0)
+        (cells (and (< ans--cursor-row (ans-grid-height ans--grid))
+                    (aref (ans-grid-rows ans--grid) ans--cursor-row))))
+    (when cells
+      (let ((index (1- (length cells))))
+        (while (and (> index 0) (ans-cell-default-p (aref cells index)))
+          (setq index (1- index)))
+        (setq column (if (ans-cell-default-p (aref cells index)) 0 index))))
+    (ans--move-cursor ans--cursor-row column)))
+
+(defun ans-tab-cell ()
+  "Move the cursor to the next eighth column."
+  (interactive)
+  (ans--require-edit)
+  (let* ((width (ans-grid-width ans--grid))
+         (step (- 8 (mod ans--cursor-col 8)))
+         (next (min (1- width) (+ ans--cursor-col (if (zerop step) 8 step)))))
+    (ans--move-cursor ans--cursor-row next)))
+
+(defun ans-set-pen-foreground (color)
+  "Set the pen foreground to COLOR, a VGA index from 0 to 15."
+  (interactive
+   (list (ans--read-palette "Foreground (0-15): " ans--pen-fg)))
+  (ans--require-edit)
+  (setq ans--pen-fg color)
+  (ans--show-cursor)
+  (message "Foreground %s" (ans--color-label color)))
+
+(defun ans-set-pen-background (color)
+  "Set the pen background to COLOR, a VGA index from 0 to 15."
+  (interactive
+   (list (ans--read-palette "Background (0-15): " ans--pen-bg)))
+  (ans--require-edit)
+  (setq ans--pen-bg color)
+  (ans--show-cursor)
+  (message "Background %s" (ans--color-label color)))
+
+(defun ans-toggle-pen-underline ()
+  "Toggle underlining for cells typed from now on."
+  (interactive)
+  (ans--require-edit)
+  (setq ans--pen-underline (not ans--pen-underline))
+  (message "Underline %s" (if ans--pen-underline "on" "off")))
+
+(defun ans-pick-pen ()
+  "Copy the current cell's colors and underline into the pen."
+  (interactive)
+  (ans--require-edit)
+  (let ((cell (ans--cell-at ans--cursor-row ans--cursor-col)))
+    (setq ans--pen-fg (ans-cell-fg cell)
+          ans--pen-bg (ans-cell-bg cell)
+          ans--pen-underline (ans-cell-underline-p cell))
+    (message "Pen %s on %s%s"
+             (ans--color-label ans--pen-fg)
+             (ans--color-label ans--pen-bg)
+             (if ans--pen-underline ", underline" ""))))
+
+(defun ans--image-click (event)
+  "Move the cursor to the raster cell clicked by EVENT."
+  (let* ((xy (posn-object-x-y (event-start event)))
+         (scale (max 1 (or ans--scale 1)))
+         (sauce (ans-grid-sauce ans--grid))
+         (cell-width (ans--cell-width sauce))
+         (glyph-height (max 1 (ans-vga-height (ans--vga-for-sauce sauce))))
+         (width (ans-grid-width ans--grid))
+         (height (ans-grid-height ans--grid)))
+    (if (or (not xy) (<= height 0))
+        (message "Click the picture")
+      (ans--move-cursor
+       (min (1- height)
+            (max 0 (truncate (/ (cdr xy) (* scale glyph-height)))))
+       (min (1- width)
+            (max 0 (truncate (/ (car xy) (* scale cell-width)))))))))
+
+(defun ans-mouse-set-cursor (event)
+  "Move the edit cursor to the cell clicked by EVENT."
+  (interactive "e")
+  (ans--require-edit)
+  (if (eq ans--view 'image)
+      (ans--image-click event)
+    (mouse-set-point event)
+    (let* ((width (ans-grid-width ans--grid))
+           (height (ans-grid-height ans--grid))
+           (stride (1+ width))
+           (index (max 0 (- (point) (point-min)))))
+      (if (<= height 0)
+          (ans--move-cursor 0 0)
+        (let ((row (min (1- height) (/ index stride)))
+              (column (% index stride)))
+          (when (>= column width)
+            (setq column (1- width)))
+          (ans--move-cursor row column))))))
+
+(defun ans--reject-raw-edit (_beg _end)
+  "Refuse a direct change to the displayed text.
+The grid is the document.  Typed characters replace one cell, and
+undo restores a cell.  A command that edits the buffer text would
+leave the picture and the grid different."
+  (unless (or inhibit-read-only (bound-and-true-p undo-in-progress))
+    (user-error "The screen is edited one cell at a time")))
+
+(defvar ans-edit-mode-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "C-c C-c") #'ans-edit-mode)
+    (define-key map (kbd "C-c C-f") #'ans-set-pen-foreground)
+    (define-key map (kbd "C-c C-b") #'ans-set-pen-background)
+    (define-key map (kbd "C-c C-p") #'ans-pick-pen)
+    (define-key map (kbd "C-c C-u") #'ans-toggle-pen-underline)
+    (define-key map (kbd "C-c C-t") #'ans-toggle-view)
+    (define-key map (kbd "C-c C-i") #'ans-toggle-ice)
+    (define-key map (kbd "C-c C-s") #'ans-show-sauce)
+    (define-key map (kbd "C-c C-w") #'ans-set-width)
+    (define-key map (kbd "C-c C-r") #'revert-buffer)
+    (define-key map [remap self-insert-command] #'ans-insert-char)
+    (dotimes (i 95)
+      (define-key map (vector (+ 32 i)) #'ans-insert-char))
+    (define-key map (kbd "RET") #'ans-newline-cell)
+    (define-key map (kbd "TAB") #'ans-tab-cell)
+    (define-key map (kbd "DEL") #'ans-backward-delete-cell)
+    (define-key map (kbd "<backspace>") #'ans-backward-delete-cell)
+    (define-key map (kbd "<left>") #'ans-backward-cell)
+    (define-key map (kbd "<right>") #'ans-forward-cell)
+    (define-key map (kbd "<up>") #'ans-previous-line-cell)
+    (define-key map (kbd "<down>") #'ans-next-line-cell)
+    (define-key map (kbd "C-b") #'ans-backward-cell)
+    (define-key map (kbd "C-f") #'ans-forward-cell)
+    (define-key map (kbd "C-p") #'ans-previous-line-cell)
+    (define-key map (kbd "C-n") #'ans-next-line-cell)
+    (define-key map (kbd "C-a") #'ans-beginning-of-line-cell)
+    (define-key map (kbd "C-e") #'ans-end-of-line-cell)
+    (define-key map (kbd "<home>") #'ans-beginning-of-line-cell)
+    (define-key map (kbd "<end>") #'ans-end-of-line-cell)
+    (define-key map [mouse-1] #'ans-mouse-set-cursor)
+    map)
+  "Keymap for `ans-edit-mode'.")
+
+(define-minor-mode ans-edit-mode
+  "Edit the ANSI screen one cell at a time.
+Typed characters replace the cell under the cursor and use the pen.
+`C-c C-f' and `C-c C-b' set the pen colors.  `C-c C-p' copies the
+colors from the current cell.  `C-c C-u' toggles underline.  `C-c C-c'
+leaves this mode.
+
+While this mode is on, letters type glyphs.  Viewer commands are on
+the `C-c C-' prefix: `t' switches view, `i' toggles iCE colors, `s'
+shows SAUCE, `w' sets the width, and `r' reloads the file."
+  :lighter " Edit"
+  :keymap ans-edit-mode-map
+  (if ans-edit-mode
+      (progn
+        (unless (derived-mode-p 'ans-mode)
+          (setq ans-edit-mode nil)
+          (user-error "ANS editing works in an ANSI art buffer"))
+        (when (eq buffer-undo-list t)
+          (setq buffer-undo-list nil))
+        ;; `undo' and `undo-redo' refuse a read-only buffer.  The hook
+        ;; still blocks raw text edits, so the grid stays the document.
+        (setq buffer-read-only nil)
+        (add-hook 'before-change-functions #'ans--reject-raw-edit nil t)
+        (setq ans--cursor-col
+              (min ans--cursor-col
+                   (1- (max 1 (ans-grid-width ans--grid)))))
+        (ans--redisplay)
+        (message "Editing.  C-c C-c leaves edit mode.  C-c C-f sets the foreground."))
+    (remove-hook 'before-change-functions #'ans--reject-raw-edit t)
+    (when (derived-mode-p 'ans-mode)
+      (setq buffer-read-only t)
+      (ans--redisplay))))
+
 (defvar ans-mode-map
   (let ((map (make-sparse-keymap)))
     (set-keymap-parent map special-mode-map)
+    (define-key map (kbd "e") #'ans-edit-mode)
     (define-key map (kbd "t") #'ans-toggle-view)
     (define-key map (kbd "i") #'ans-toggle-ice)
     (define-key map (kbd "w") #'ans-set-width)
@@ -548,10 +1052,12 @@ A prefix argument, or WIDTH 0, follows SAUCE or uses 80."
 
 ;;;###autoload
 (define-derived-mode ans-mode special-mode "ANS"
-  "Major mode for viewing ANSI art (.ans) and SAUCE metadata.
+  "Major mode for viewing and editing ANSI art (.ans) and SAUCE metadata.
 
 The buffer shows a VGA raster, or Unicode text with the same colors.
-Saving writes the original bytes.
+`e' edits the screen one cell at a time.  Saving an edited screen
+writes ANSi for that grid.  Saving before any edit writes the original
+bytes.
 
 \\{ans-mode-map}"
   (unless ans--raw

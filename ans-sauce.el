@@ -28,7 +28,7 @@
 (require 'cl-lib)
 
 (defgroup ans nil
-  "View ANSI art and SAUCE metadata."
+  "View and edit ANSI art and SAUCE metadata."
   :group 'multimedia
   :prefix "ans-")
 
@@ -75,6 +75,25 @@ Byte 0 is a space.  Bytes 1-31 and 127 are the graphic glyphs.")
 (defun ans-cp437-char (byte)
   "Return the Unicode character for CP437 BYTE."
   (aref ans-cp437-table (logand byte 255)))
+
+(defconst ans-cp437-reverse
+  (let ((map (make-hash-table :test #'eq)))
+    (dotimes (byte 256)
+      (let ((char (aref ans-cp437-table byte)))
+        ;; Space is both byte 0 and byte 32.  Prefer the printable byte.
+        (when (or (null (gethash char map)) (>= byte 32))
+          (puthash char byte map))))
+    map)
+  "Map a Unicode character back to a CP437 byte.")
+
+(defun ans-cp437-byte (char)
+  "Return the CP437 byte for CHAR, or nil when CHAR has no glyph."
+  (and (characterp char) (gethash char ans-cp437-reverse)))
+
+(defconst ans-stream-controls '(9 10 13 26 27)
+  "CP437 bytes that an ANSI stream treats as controls.
+Tab, line feed, carriage return, SUB, and escape cannot be stored as
+glyphs.  The other bytes below 32 are the classic control pictures.")
 
 (defun ans--u16 (bytes index)
   "Read a little-endian unsigned 16-bit value from BYTES at INDEX."
@@ -238,8 +257,82 @@ Nil means the legacy value, which does not request either width."
                       (format "FileType %d" file))))
     (format "%s / %s" data-name file-name)))
 
+(defun ans--field (text length)
+  "Return LENGTH CP437 bytes for TEXT, padded with spaces.
+A character with no CP437 glyph is stored as `?'."
+  (setq text (or text ""))
+  (with-temp-buffer
+    (set-buffer-multibyte nil)
+    (dotimes (i length)
+      (insert (if (< i (length text))
+                  (or (ans-cp437-byte (aref text i)) ??)
+                32)))
+    (buffer-string)))
+
+(defun ans--date-field (date)
+  "Return the 8-byte SAUCE date for DATE.
+DATE is YYYY-MM-DD, 8 raw characters, or nil."
+  (ans--field
+   (if (and date
+            (string-match
+             "\\`\\([0-9]\\{4\\}\\)-\\([0-9]\\{2\\}\\)-\\([0-9]\\{2\\}\\)\\'"
+             date))
+       (concat (match-string 1 date)
+               (match-string 2 date)
+               (match-string 3 date))
+     date)
+   8))
+
+(defun ans--u16-bytes (value)
+  "Return the little-endian encoding of the 16-bit integer VALUE."
+  (unibyte-string (logand value 255) (logand (ash value -8) 255)))
+
+(defun ans--u32-bytes (value)
+  "Return the little-endian encoding of the 32-bit integer VALUE."
+  (unibyte-string (logand value 255)
+                  (logand (ash value -8) 255)
+                  (logand (ash value -16) 255)
+                  (logand (ash value -24) 255)))
+
+(defun ans-sauce-encode (sauce)
+  "Return the SAUCE trailer for SAUCE.
+The trailer is one EOF byte, the comment block, and the 128-byte
+record.  SAUCE is an `ans-sauce' struct.  Its file size, column count,
+row count, flags, and file type are stored as they stand."
+  (let* ((comments (ans-sauce-comments sauce))
+         (count (length comments)))
+    (when (> count 255)
+      (error "SAUCE holds at most 255 comments"))
+    (with-temp-buffer
+      (set-buffer-multibyte nil)
+      (insert 26)
+      (when (> count 0)
+        (insert "COMNT")
+        (dolist (comment comments)
+          (insert (ans--field comment 64))))
+      (insert "SAUCE" "00"
+              (ans--field (ans-sauce-title sauce) 35)
+              (ans--field (ans-sauce-author sauce) 20)
+              (ans--field (ans-sauce-group sauce) 20)
+              (ans--date-field (ans-sauce-date sauce))
+              (ans--u32-bytes (or (ans-sauce-file-size sauce) 0))
+              (or (ans-sauce-data-type sauce) 1)
+              (or (ans-sauce-file-type sauce) 1)
+              (ans--u16-bytes (or (ans-sauce-tinfo1 sauce) 0))
+              (ans--u16-bytes (or (ans-sauce-tinfo2 sauce) 0))
+              (ans--u16-bytes (or (ans-sauce-tinfo3 sauce) 0))
+              (ans--u16-bytes (or (ans-sauce-tinfo4 sauce) 0))
+              count
+              (or (ans-sauce-flags sauce) 0)
+              (ans--field (ans-sauce-font sauce) 22))
+      (buffer-string))))
+
 (provide 'ans-sauce)
 ;;; ans-sauce.el ends here
+
+;; Local Variables:
+;; package-lint-main-file: "ans-mode.el"
+;; End:
 
 ;; Local Variables:
 ;; package-lint-main-file: "ans-mode.el"

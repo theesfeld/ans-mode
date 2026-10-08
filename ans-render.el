@@ -115,6 +115,59 @@ A nil cell is a space with light gray on black."
   "Non-nil when CELL is italic."
   (not (zerop (logand (ans-cell-flags cell) 2))))
 
+(defun ans-cell-default-p (cell)
+  "Non-nil when CELL is a light-gray space on black."
+  (and (= (ans-cell-char cell) 32)
+       (equal (ans-cell-fg cell) 7)
+       (equal (ans-cell-bg cell) 0)
+       (= (ans-cell-flags cell) 0)))
+
+(defun ans-make-cell (char fg bg &optional flags)
+  "Return a cell for CP437 CHAR with FG, BG, and FLAGS."
+  (vector (logand char 255) fg bg (or flags 0)))
+
+(defun ans-grid-set-height (grid height)
+  "Give GRID exactly HEIGHT rows, dropping rows past the end."
+  (let ((rows (make-vector height nil)))
+    (dotimes (i height)
+      (aset rows i (aref (ans-grid-rows grid) i)))
+    (setf (ans-grid-rows grid) rows)
+    (setf (ans-grid-height grid) height)
+    grid))
+
+(defun ans-grid-set-cell (grid row column cell)
+  "Store CELL at ROW and COLUMN of GRID.
+ROW equal to the height adds one row of empty cells.  COLUMN must
+already be inside the width.  Return CELL."
+  (when (or (< row 0) (> row (ans-grid-height grid))
+            (< column 0) (>= column (ans-grid-width grid)))
+    (error "Cell %d,%d is outside the %d×%d screen"
+           row column (ans-grid-width grid) (ans-grid-height grid)))
+  (when (= row (ans-grid-height grid))
+    (when (>= row ans-max-rows)
+      (error "ANSI screen is limited to %d rows" ans-max-rows))
+    (setf (ans-grid-rows grid)
+          (vconcat (ans-grid-rows grid)
+                   (vector (make-vector (ans-grid-width grid) nil))))
+    (setf (ans-grid-height grid) (1+ row)))
+  (aset (aref (ans-grid-rows grid) row) column cell)
+  cell)
+
+(defun ans-grid-set-width (grid width)
+  "Resize GRID to WIDTH columns, keeping the left side of each row."
+  (setq width (max 1 (min ans-max-columns width)))
+  (let* ((height (ans-grid-height grid))
+         (rows (make-vector height nil)))
+    (dotimes (row height)
+      (let ((line (make-vector width nil))
+            (old (aref (ans-grid-rows grid) row)))
+        (dotimes (column (min width (length old)))
+          (aset line column (aref old column)))
+        (aset rows row line)))
+    (setf (ans-grid-width grid) width)
+    (setf (ans-grid-rows grid) rows)
+    grid))
+
 (defun ans--raw-bytes (bytes)
   "Return BYTES as a string whose characters are the raw byte values."
   (cond
@@ -435,8 +488,126 @@ The grid's rows are vectors of cells.  Each cell is a vector
           (ans-grid--make :width width :height (1+ max-row) :ice ice
                           :sauce sauce :rows out :truncated truncated))))))
 
+(defun ans--style-bytes (fg bg flags)
+  "Return an SGR sequence that selects FG, BG, and FLAGS.
+FLAGS bit 0 is underline.  Bit 1 is italic.  The sequence starts by
+resetting, so it does not depend on the previous cell."
+  (let ((parts (list 0))
+        (underline (not (zerop (logand flags 1))))
+        (italic (not (zerop (logand flags 2)))))
+    (cond
+     ((and (integerp fg) (<= 0 fg 7))
+      (unless (= fg 7) (setq parts (append parts (list (+ 30 fg))))))
+     ((and (integerp fg) (<= 8 fg 15))
+      (setq parts (append parts (list (+ 90 (- fg 8))))))
+     ((and (integerp fg) (<= 16 fg 255))
+      (setq parts (append parts (list 38 5 fg))))
+     ((consp fg)
+      (setq parts (append parts (list 38 2 (nth 0 fg) (nth 1 fg) (nth 2 fg))))))
+    (cond
+     ((and (integerp bg) (<= 0 bg 7))
+      (unless (= bg 0) (setq parts (append parts (list (+ 40 bg))))))
+     ((and (integerp bg) (<= 8 bg 15))
+      (setq parts (append parts (list (+ 100 (- bg 8))))))
+     ((and (integerp bg) (<= 16 bg 255))
+      (setq parts (append parts (list 48 5 bg))))
+     ((consp bg)
+      (setq parts (append parts (list 48 2 (nth 0 bg) (nth 1 bg) (nth 2 bg))))))
+    (when underline (setq parts (append parts (list 4))))
+    (when italic (setq parts (append parts (list 3))))
+    (with-temp-buffer
+      (set-buffer-multibyte nil)
+      (insert 27 ?\[)
+      (insert (mapconcat #'number-to-string parts ";"))
+      (insert ?m)
+      (buffer-string))))
+
+(defun ans--glyph-byte (cell)
+  "Return the CP437 byte to write for CELL.
+Bytes in `ans-stream-controls' cannot round-trip through an ANSI
+stream."
+  (let ((byte (ans-cell-char cell)))
+    (when (memq byte ans-stream-controls)
+      (error "ANSI stream cannot store CP437 byte %d" byte))
+    byte))
+
+(defun ans--encode-artwork (grid)
+  "Return the ANSI byte stream that draws GRID.
+Each row ends in CR LF.  Trailing default cells are omitted.  The
+column count is the grid width, so a short row does not wrap."
+  (with-temp-buffer
+    (set-buffer-multibyte nil)
+    (let ((style nil)
+          (width (ans-grid-width grid)))
+      (dotimes (row (ans-grid-height grid))
+        (let* ((cells (aref (ans-grid-rows grid) row))
+               (last (1- width)))
+          (while (and (>= last 0)
+                      (ans-cell-default-p (aref cells last)))
+            (setq last (1- last)))
+          ;; A blank row still writes one space, so the row survives a
+          ;; later load.  A bare CR LF would leave no cell behind.
+          (if (< last 0)
+              (insert 32)
+            (dotimes (column (1+ last))
+              (let* ((cell (aref cells column))
+                     (key (list (ans-cell-fg cell)
+                                (ans-cell-bg cell)
+                                (ans-cell-flags cell))))
+                (unless (equal key style)
+                  (insert (ans--style-bytes (car key) (cadr key) (caddr key)))
+                  (setq style key))
+                (insert (ans--glyph-byte cell))))))
+        (insert 13 10)))
+    (buffer-string)))
+
+(defun ans--sauce-for-save (grid artwork-length)
+  "Update GRID's SAUCE record for an artwork of ARTWORK-LENGTH bytes.
+The saved file is ANSi.  Title, author, group, date, font, comments,
+and the spacing and aspect flags are kept.  Return the struct."
+  (let ((sauce (or (ans-grid-sauce grid)
+                   (ans-sauce--make
+                    :version "00" :title "" :author "" :group ""
+                    :date (format-time-string "%Y-%m-%d")
+                    :file-size 0 :data-type 1 :file-type 1
+                    :tinfo1 0 :tinfo2 0 :tinfo3 0 :tinfo4 0
+                    :comments nil
+                    :flags (if (ans-grid-ice grid) 1 0)
+                    :font "IBM VGA"
+                    :data-end 0))))
+    (setf (ans-sauce-version sauce) "00")
+    (setf (ans-sauce-data-type sauce) 1)
+    (setf (ans-sauce-file-type sauce) 1)
+    (setf (ans-sauce-tinfo1 sauce) (ans-grid-width grid))
+    (setf (ans-sauce-tinfo2 sauce) (ans-grid-height grid))
+    (setf (ans-sauce-flags sauce)
+          (logior (logand (or (ans-sauce-flags sauce) 0) #xFE)
+                  (if (ans-grid-ice grid) 1 0)))
+    ;; The EOF byte is part of the file and is not part of SAUCE.
+    (setf (ans-sauce-file-size sauce) (1+ artwork-length))
+    (unless (ans-sauce-font sauce)
+      (setf (ans-sauce-font sauce) "IBM VGA"))
+    (unless (ans-sauce-title sauce) (setf (ans-sauce-title sauce) ""))
+    (unless (ans-sauce-author sauce) (setf (ans-sauce-author sauce) ""))
+    (unless (ans-sauce-group sauce) (setf (ans-sauce-group sauce) ""))
+    (unless (ans-sauce-date sauce)
+      (setf (ans-sauce-date sauce) (format-time-string "%Y-%m-%d")))
+    (setf (ans-grid-sauce grid) sauce)
+    sauce))
+
+(defun ans-encode-grid (grid)
+  "Return ANSI bytes that draw GRID, followed by its SAUCE record.
+The record describes this still screen.  An ANSiMation is saved as
+ANSi of the canvas, which replaces the original stream."
+  (let ((artwork (ans--encode-artwork grid)))
+    (concat artwork (ans-sauce-encode (ans--sauce-for-save grid (length artwork))))))
+
 (provide 'ans-render)
 ;;; ans-render.el ends here
+
+;; Local Variables:
+;; package-lint-main-file: "ans-mode.el"
+;; End:
 
 ;; Local Variables:
 ;; package-lint-main-file: "ans-mode.el"

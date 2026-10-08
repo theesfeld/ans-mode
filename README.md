@@ -2,7 +2,7 @@
 
 `ans-mode` is an Emacs major mode for ANSI art. Open a `.ans` file and Emacs draws the picture: a VGA font raster, in the colors the file asked for, with the SAUCE title and author in the header line.
 
-Press `t` for a Unicode text view of the same screen. That view can be searched and copied. Saving writes the original file bytes back to disk.
+Press `t` for a Unicode text view of the same screen. That view can be searched and copied. Press `e` to edit the screen: typed characters replace the cell under the cursor. Saving before you edit writes the original file bytes. Saving after you edit writes the screen you see, as ANSi, and keeps the SAUCE title, author, and comments.
 
 The picture is a still. An ANSiMation is the screen left after the whole stream has been drawn. Blink is kept as a color attribute.
 
@@ -132,6 +132,7 @@ Press `t` to switch. `t` again returns to the other view. If the raster cannot b
 
 | Key | Command | What it does |
 | --- | --- | --- |
+| `e` | `ans-edit-mode` | Edit the screen. Letters then type glyphs. `C-c C-c` leaves edit mode. |
 | `t` | `ans-toggle-view` | Switch between the raster and the text view. |
 | `+` | `ans-increase-scale` | Make the raster one step larger, up to 8. |
 | `-` | `ans-decrease-scale` | Make the raster one step smaller, down to 1. |
@@ -269,11 +270,49 @@ A file with no record still opens. That buffer says so, and reports the rendered
 
 Comments are also counted in the header line. The artwork itself stops before the SAUCE record, a preceding comment block, and a preceding EOF byte (`0x1A`).
 
+## Editing
+
+`e` turns on editing. The header line shows the cursor as `row,column`, counting from 1, and the pen as `pen foreground/background`. In the raster the current cell is inverted. In the text view the Emacs cursor sits on that cell. Click a cell to move there.
+
+Typing replaces that cell and moves to the next one. At the right edge the cursor wraps to the next row, and a new row is added when you type or move past the last one. The picture is a fixed grid: a new character overwrites the cell. It does not push the rest of the line sideways.
+
+| Key | What it does while editing |
+| --- | --- |
+| letters, numbers, punctuation, `SPC` | Write that CP437 glyph with the current pen. |
+| arrows, `C-f`, `C-b`, `C-n`, `C-p` | Move one cell. |
+| `C-a`, `Home` | First column of this row. |
+| `C-e`, `End` | Last drawn cell on this row. |
+| `TAB` | Next eighth column. |
+| `RET` | First column of the next row. |
+| `DEL`, `Backspace` | Move back one cell and paint a space with the pen. |
+| `C-/`, `C-_`, `C-x u` | Undo the last cell change. |
+| `C-?` | Redo the cell change just undone. |
+| `C-c C-f` | Set the foreground, 0 through 15. |
+| `C-c C-b` | Set the background, 0 through 15. |
+| `C-c C-u` | Toggle underline for cells typed from now on. |
+| `C-c C-p` | Copy the current cell's colors into the pen. |
+| `C-c C-t` | Switch between the raster and the text view. |
+| `C-c C-i` | Toggle the iCE-colors flag. |
+| `C-c C-s` | Show the SAUCE record. |
+| `C-c C-w` | Set the column count. |
+| `C-c C-r` | Reload the file from disk and discard edits. |
+| `C-c C-c` | Leave edit mode. |
+
+The palette is the VGA set. 0 is black, 1 red, 2 green, 3 brown, 4 blue, 5 magenta, 6 cyan, 7 light gray. 8 through 15 are the bright versions of those, ending at 15 white. A background of 8 through 15 is a bright background.
+
+`C-c C-p` can pick a 256-color or 24-bit color out of an existing cell. The next characters you type keep that color. `C-c C-f` and `C-c C-b` return the pen to a VGA index.
+
+Viewer keys such as `t` and `s` type those letters while you are editing. Use the `C-c C-` bindings above for those commands, then `C-c C-c` when you want the viewer keys back.
+
+A glyph that has no CP437 byte is refused. Tab, line feed, carriage return, the DOS end-of-file byte, and escape are controls in an ANSI stream, so those five CP437 pictures cannot be stored in the file.
+
 ## Saving and reloading
 
-`C-x C-s` writes the original bytes to the visited file. The rendered text and the raster are a view; they are not the file contents.
+`C-x C-s` before you edit writes the original bytes to the visited file. An ANSiMation stays the original stream.
 
-`g` reads the file from disk again and draws it. Width, iCE, view, and scale choices you made in the buffer stay in place.
+`C-x C-s` after you edit writes the screen as an ANSi file: one row of CP437 and color codes at a time, then the SAUCE record. The title, author, group, date, font, comments, letter spacing, and aspect flag are kept. The column count, row count, and iCE flag match the screen you edited. The saved file is a still. An ANSiMation's original stream is replaced by that still when you save an edit.
+
+`g` outside edit mode, and `C-c C-r` while editing, read the file from disk again and discard edits. Width, iCE, view, and scale choices you made in the buffer stay in place.
 
 ## What the drawing understands
 
